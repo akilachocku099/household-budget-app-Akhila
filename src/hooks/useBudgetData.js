@@ -1,0 +1,140 @@
+import { useCallback, useEffect, useState } from "react";
+import { initialData } from "../data";
+import { fetchExpenses, addExpense, deleteExpense, fetchSettings, saveSettings } from "../aws";
+import { cleanBudgetData } from "../lib/budget";
+
+
+function mapAwsExpense(item) {
+  return {
+    id: item.expenseId,
+    expenseId: item.expenseId,
+    date: item.date,
+    fortnight: item.fortnight || 1,
+    month: item.month || "Jan",
+    category: item.category,
+    description: item.description || "",
+    amount: item.amount,
+    importBatch: item.importBatch || null,
+  };
+}
+
+export function useBudgetData() {
+  const [settings, setSettings] = useState({
+    categories: initialData.categories,
+    incomes: initialData.incomes,
+    months: initialData.months,
+  });
+  const [transactions, setTransactions] = useState([]);
+  const [cloudStatus, setCloudStatus] = useState("Connecting…");
+  const [ready, setReady] = useState(false);
+  const [lastImportBatch, setLastImportBatch] = useState(() => {
+  try { return localStorage.getItem("household-budget-last-import-batch") || null; } catch { return null; }
+});
+  const loadAll = useCallback(async () => {
+    try {
+      const [items, remoteSettings] = await Promise.all([fetchExpenses(), fetchSettings()]);
+      setTransactions(items.map(mapAwsExpense));
+      if (remoteSettings) {
+        setSettings({
+          categories: remoteSettings.categories?.length ? remoteSettings.categories : initialData.categories,
+          incomes: remoteSettings.incomes?.length ? remoteSettings.incomes : initialData.incomes,
+          months: initialData.months,
+        });
+      } else {
+        // First time this user has connected — seed AWS with the defaults
+        await saveSettings(initialData.categories, initialData.incomes);
+      }
+      setCloudStatus("Cloud synced");
+    } catch (error) {
+      console.error("AWS load failed:", error);
+      setCloudStatus("Offline — couldn't reach AWS");
+    } finally {
+      setReady(true);
+    }
+  }, []);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+
+  const data = cleanBudgetData({ ...settings, transactions });
+
+  const updateData = async (nextData) => {
+    const next = {
+      categories: nextData.categories,
+      incomes: nextData.incomes,
+      months: nextData.months,
+    };
+    setSettings(next); // update UI immediately
+    if (!ready) return;
+    setCloudStatus("Saving…");
+    try {
+      await saveSettings(next.categories, next.incomes);
+      setCloudStatus("Cloud synced");
+    } catch (error) {
+      console.error("AWS settings save failed:", error);
+      setCloudStatus("Save failed — check connection");
+    }
+  };
+
+  const addTransaction = async (tx) => {
+    setCloudStatus("Saving…");
+    try {
+      await addExpense(tx);
+      await loadAll();
+    } catch (error) {
+      console.error("AWS save failed:", error);
+      setCloudStatus("Save failed — check connection");
+    }
+  };
+
+  const removeTransaction = async (id) => {
+    setCloudStatus("Deleting…");
+    try {
+      await deleteExpense(id);
+      await loadAll();
+    } catch (error) {
+      console.error("AWS delete failed:", error);
+      setCloudStatus("Delete failed — check connection");
+    }
+  };
+  const importTransactions = async (list) => {
+  const batchId = `import-${Date.now()}`;
+  setCloudStatus("Importing…");
+  let ok = 0;
+  let failed = 0;
+  for (const tx of list) {
+    try {
+      await addExpense({ ...tx, importBatch: batchId });
+      ok++;
+    } catch (error) {
+      failed++;
+      console.error("Import row failed:", tx, error);
+    }
+  }
+  await loadAll();
+  setCloudStatus(failed ? `Imported ${ok}, ${failed} failed` : "Cloud synced");
+  if (ok > 0) {
+    setLastImportBatch(batchId);
+    try { localStorage.setItem("household-budget-last-import-batch", batchId); } catch {}
+  }
+  return { ok, failed };
+};
+const undoLastImport = async () => {
+  if (!lastImportBatch) return { deleted: 0 };
+  setCloudStatus("Undoing import…");
+  const toRemove = transactions.filter((t) => t.importBatch === lastImportBatch);
+  let deleted = 0;
+  for (const t of toRemove) {
+    try {
+      await deleteExpense(t.expenseId);
+      deleted++;
+    } catch (error) {
+      console.error("Undo delete failed:", t, error);
+    }
+  }
+  await loadAll();
+  setLastImportBatch(null);
+  try { localStorage.removeItem("household-budget-last-import-batch"); } catch {}
+  setCloudStatus("Cloud synced");
+  return { deleted };
+};
+return { data, cloudStatus, isCloudEnabled: true, updateData, addTransaction, removeTransaction, importTransactions, undoLastImport, lastImportBatch };}
